@@ -1,0 +1,1231 @@
+Flask is installed (3.1.3). Now printing the full annotated code:
+
+```python
+"""
+================================================================================
+ Health 360 - Personalized Medical Assistance Web App  (SINGLE FILE)
+================================================================================
+# What this file is: the entire Health 360 medical-assistance web app in one
+# single Python file so it can be dropped into any project easily.
+
+WHAT IT DOES
+------------
+A single-file Flask web app that gives personalised medical assistance:
+
+  * Patient registers once (name, age, weight, blood group, allergies,
+    emergency contacts) so everything is personalised.
+  * Patient describes symptoms -> the app classifies SEVERITY:
+        low  / medium  -> immediate home remedy (basic medicine) with a
+                          safety TIME DELAY based on the medicine reaction
+                          time (prevents over-dosage and random emergency
+                          calls).  A countdown shows the reaction window.
+                          If the remedy has NOT worked when the timer runs
+                          out, the app AUTOMATICALLY dispatches an ambulance.
+        high / critical -> auto-notify the hospital, auto-call the emergency
+                          contacts, and (if the estimated cost exceeds the
+                          insurance cover) ask whether to apply for insurance.
+  * An EMERGENCY button is available on BOTH the criticality page and the
+    remedy page.
+  * A HISTORY page shows every problem: symptoms, severity, medicine given,
+    cost, every action taken (hospital called, contacts called, insurance,
+    ambulance dispatched, resolved) and timestamps.
+  * "Start a new problem" button on every result page.
+
+FRIEND INTEGRATION (YOUR TWO PARTS OF CODE)
+-------------------------------------------
+Your friends' code can connect through the JSON API below.  The API hands
+them the patient information + the SEVERITY so they can trigger their
+hospital / emergency-contact / ambulance systems.
+
+    Health check ........ GET   /api/health
+    Create patient ...... POST  /api/patients
+    Assess severity ..... POST  /api/severity          {"symptoms":[...], "patient_id":"..."}
+    Patient details ..... GET   /api/patients/<id>
+    Patient history ..... GET   /api/patients/<id>/history
+    Episode details ..... GET   /api/episodes/<id>
+    Trigger actions ..... POST  /api/episodes/<id>/actions  {"action":"hospital|contacts|ambulance|resolve|insurance","choice":"yes|no"}
+
+Where their real endpoints live, point INTEGRATION at them below (look for
+the "INTEGRATION HOOKS" section).  Until they plug in, every notification is
+simulated in the terminal and shown as a test entry in the history.
+
+RUNNING
+-------
+    pip install flask
+    python medical_assistant.py
+    then open http://127.0.0.1:5500
+
+================================================================================
+"""
+
+from __future__ import annotations  # enables modern type-hint syntax on older Python
+
+import threading  # used for the background ambulance-sweeper thread and Store lock
+import time       # used for timestamps and deadline (reaction-timer) math
+import uuid       # generates unique patient and episode IDs
+import webbrowser # auto-opens the app in the default browser on startup
+from dataclasses import dataclass, field  # compact data-model classes + default lists
+from datetime import datetime  # for human-readable timestamps
+from typing import Any, Dict, List, Literal, Optional, Tuple  # type annotations used everywhere
+
+from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for  # web framework + helpers
+
+# ---------------------------------------------------------------------------
+# 1. CONFIGURATION
+# ---------------------------------------------------------------------------
+
+APP_NAME: str = "Health 360"  # name shown in the header, footer and API responses
+HOST: str = "127.0.0.1"       # only listen on this machine (safe for dev)
+PORT: int = 5500   # 5000 is commonly taken - change freely  # port the web app runs on
+SECRET_KEY: str = "med-assist-dev-secret-change-me"  # signs browser session cookies
+
+# Timer behaviour:
+#   "fast" -> reaction time is counted in SECONDS (great for demos/tests)
+#   "real" -> reaction time is counted in real MINUTES (production)
+TIMER_MODE: str = "fast"  # switch to "real" when you go live so the countdown uses real minutes
+
+INSURANCE_COVER_LIMIT: float = 2000.0   # estimated cost above this -> offer insurance  # the insurance threshold in currency units
+SWEEP_INTERVAL: float = 2.0             # seconds between automatic ambulance checks  # how often the background thread re-checks timers
+
+# ---------------------------------------------------------------------------
+# 2. INTEGRATION HOOKS  (your friends replace these URLs with their code)
+# ---------------------------------------------------------------------------
+
+HOSPITAL_API_URL: str = ""      # e.g. "http://192.168.1.20:8000/api/hospital"  # your friend's hospital endpoint (empty = simulated)
+AMBULANCE_API_URL: str = ""     # e.g. "http://192.168.1.21:8000/api/ambulance"  # your friend's ambulance endpoint (empty = simulated)
+CONTACT_SMS_API_URL: str = ""   # e.g. "http://192.168.1.22:8000/api/contacts/sms"  # your friend's SMS endpoint for emergency contacts
+
+AMBULANCE_PHONE: str = "108"  # emergency ambulance telephone number shown to the patient
+DEFAULT_HOSPITAL: str = "City General Hospital"  # name of the hospital the alert is addressed to
+
+# ---------------------------------------------------------------------------
+# 3. MEDICAL KNOWLEDGE BASE
+# ---------------------------------------------------------------------------
+
+#: symptom keywords -> severity level (checked highest first)
+SEVERITY_RULES: Dict[str, List[str]] = {  # keyword -> severity mapping used for classification
+    "critical": [  # most dangerous symptoms get classified as critical
+        "unconscious", "not breathing", "no pulse", "severe bleeding",  # life-threatening states
+        "heart attack", "chest pain", "stroke", "seizure", "overdose",  # major medical emergencies
+        "paralysis", "blue lips", "gasping", "suicidal", "drowning",    # severe / fatal-risk signs
+        "electrocution", "poisoning", "coughing blood", "severe burns", # accidents / poisoning
+    ],
+    "high": [  # serious symptoms get classified as high
+        "high fever", "vomiting blood", "severe pain", "difficulty breathing",  # urgent warning signs
+        "swollen", "broken bone", "fracture", "blood in stool", "fainting",     # injuries / internal signs
+        "blood in vomit", "fever 104", "blurry vision", "weakness one side",    # potentially severe indicators
+    ],
+    "medium": [  # common / moderate symptoms get classified as medium
+        "fever", "headache", "stomach pain", "nausea", "vomiting", "diarrhea", # everyday illnesses
+        "cough", "sore throat", "pain", "rash", "allergy", "sneezing",         # mild common symptoms
+        "runny nose", "dizziness", "cold", "insect bite",                      # mild / seasonal symptoms
+    ],
+    # everything that matched nothing above is "low"  # any symptom not listed falls back to low severity
+}
+
+#: medicine remedies - each has a REACTION TIME (minutes) used for the delay
+@dataclass(frozen=True)  # make Remedy an immutable value object
+class Remedy:  # describes one home remedy / medicine
+    medicine: str  # name of the medicine or remedy
+    dosage: str    # how much and how often to take it
+    category: str  # what kind of medicine it is (painkiller, antacid, ...)
+    reaction_minutes: int  # how long until it should start working (drives the safety timer)
+    note: str      # extra advice / warnings for the patient
+    price: float   # approximate cost, used for the insurance check
+
+
+@dataclass(frozen=True)  # make RemedyRule an immutable value object
+class RemedyRule:  # links a set of symptoms to a diagnosis and a remedy
+    keywords: List[str]  # symptom words that trigger this rule
+    diagnosis: str       # human-readable diagnosis shown to the patient
+    remedy: Remedy       # the medicine / remedy to prescribe
+
+
+REMEDY_RULES: List[RemedyRule] = [  # the full knowledge base of symptom -> remedy rules
+    RemedyRule(["headache"], "Likely tension / mild headache",  # rule: headache symptoms
+               Remedy("Paracetamol (Acetaminophen)", "500 mg every 6 hours, max 3/day",  # medicine + dosage
+                      "Painkiller", 30, "Take with food and stay hydrated.", 45.0)),      # category, reaction mins, note, price
+    RemedyRule(["fever"], "Mild to moderate fever",  # rule: fever symptoms
+               Remedy("Ibuprofen (or Paracetamol)", "200 mg every 6-8 hours with food",  # medicine + dosage
+                      "Antipyretic", 30, "Drink plenty of fluids; monitor temperature.", 60.0)),  # category, reaction mins, note, price
+    RemedyRule(["cough"], "Dry / mild cough",  # rule: cough symptoms
+               Remedy("Cough syrup (Dextromethorphan)", "1 tsp (5 ml) at bedtime",  # medicine + dosage
+                      "Cough suppressant", 30, "Do not take with other cold medicines.", 95.0)),  # category, reaction mins, note, price
+    RemedyRule(["cold", "runny nose", "sneezing"], "Common cold / mild allergy",  # rule: cold / allergy symptoms
+               Remedy("Cetirizine (antihistamine)", "10 mg once daily",  # medicine + dosage
+                      "Antihistamine", 20, "May cause drowsiness - avoid driving.", 55.0)),  # category, reaction mins, note, price
+    RemedyRule(["sore throat"], "Mild throat irritation",  # rule: sore throat symptoms
+               Remedy("Salt-water gargle + throat lozenge", "Gargle every 4 hours",  # medicine + usage
+                      "Soothing", 20, "Warm saline gargle reduces swelling.", 30.0)),  # category, reaction mins, note, price
+    RemedyRule(["stomach pain", "indigestion"], "Indigestion / mild gastritis",  # rule: stomach symptoms
+               Remedy("Antacid (Omeprazole)", "20 mg before breakfast",  # medicine + dosage
+                      "Antacid", 20, "Avoid spicy and oily food today.", 70.0)),  # category, reaction mins, note, price
+    RemedyRule(["nausea"], "Mild nausea",  # rule: nausea symptoms
+               Remedy("Ginger tea + ORS", "Sip slowly every 15 minutes",  # remedy + instructions
+                      "Rehydration", 25, "Rest; resume small bland meals.", 40.0)),  # category, reaction mins, note, price
+    RemedyRule(["diarrhea"], "Mild gastroenteritis",  # rule: diarrhea symptoms
+               Remedy("ORS + Loperamide", "ORS after each loose stool; 2 mg after first",  # remedy + dosage
+                      "Anti-diarrheal", 30, "Hydration is the priority.", 85.0)),  # category, reaction mins, note, price
+    RemedyRule(["allergy", "rash", "insect bite"], "Mild allergic reaction",  # rule: allergy / rash symptoms
+               Remedy("Cetirizine + calamine lotion", "10 mg once; apply lotion on rash",  # remedy + dosage
+                      "Antihistamine", 20, "If hives spread or lips swell, call emergency.", 90.0)),  # category, reaction mins, note, price
+    RemedyRule(["tired", "fatigue"], "General fatigue / dehydration",  # rule: tiredness symptoms
+               Remedy("Hydration + glucose + rest", "500 ml ORS + 2 tbsp glucose",  # remedy + instructions
+                      "Rehydration", 30, "Have a light meal and rest.", 25.0)),  # category, reaction mins, note, price
+    RemedyRule(["insomnia", "stress"], "Mild stress / poor sleep",  # rule: sleep / stress symptoms
+               Remedy("Warm milk + deep breathing", "One glass before bed",  # remedy + instructions
+                      "Relaxation", 20, "Avoid screens 30 minutes before sleep.", 20.0)),  # category, reaction mins, note, price
+    RemedyRule(["dizziness"], "Possible low blood pressure",  # rule: dizziness symptoms
+               Remedy("ORS + salty snack + rest", "Drink ORS and lie down",  # remedy + instructions
+                      "Rehydration", 20, "Rise slowly from sitting.", 30.0)),  # category, reaction mins, note, price
+]
+
+#: rough cost per severity for the insurance check
+COST_BY_SEVERITY: Dict[str, float] = {  # base estimated cost for each severity level
+    "low": 150.0, "medium": 450.0, "high": 2800.0, "critical": 45000.0,  # cost lookup (lowest -> highest)
+}
+
+# ---------------------------------------------------------------------------
+# 4. DATA MODEL
+# ---------------------------------------------------------------------------
+
+
+@dataclass  # make Contact a plain data container
+class Contact:  # one emergency contact person
+    name: str      # contact's full name
+    phone: str     # contact's phone number
+    relation: str  # their relationship to the patient (mother, friend, ...)
+
+
+@dataclass  # make Patient a plain data container
+class Patient:  # stores everything personal about one user
+    id: str  # unique patient id
+    name: str  # patient's full name
+    age: int  # patient's age
+    weight_kg: float  # patient's weight in kilograms
+    blood_group: str  # blood type e.g. O+
+    allergies: List[str]  # list of allergies the patient has
+    contacts: List[Contact]  # emergency contact people for this patient
+    created_at: str  # when the profile was created
+    episodes: List[str] = field(default_factory=list)  # list of episode IDs belonging to this patient
+
+
+@dataclass  # make Episode a plain data container
+class Episode:  # one single medical problem / visit (a "case")
+    id: str  # unique episode id
+    patient_id: str  # which patient this episode belongs to
+    symptoms: List[str]  # cleaned list of reported symptoms
+    severity: Literal["low", "medium", "high", "critical"]  # the classified severity level
+    diagnosis: str  # human-readable diagnosis text
+    remedy: Optional[Dict[str, Any]]  # recommended medicine details (None if none)
+    est_cost: float  # estimated treatment cost
+    status: str  # remedy_active | resolved | hospital_notified | ambulance_dispatched  # lifecycle state of the episode
+    created_at: str  # when the episode was created
+    deadline_ts: Optional[float]  # unix time when the remedy reaction timer expires (None if not active)
+    insurance_status: str = "not_applicable"  # not_applicable|offered|applied|declined  # insurance flow state
+    actions: List[Dict[str, str]] = field(default_factory=list)  # full audit trail of what happened (timeline)
+
+
+class Store:
+    """In-memory database with a lock (safe for the background sweeper thread)."""  # thread-safe data storage
+
+    def __init__(self) -> None:  # constructor for the store
+        self._lock: threading.Lock = threading.Lock()  # lock so threads don't corrupt data
+        self.patients: Dict[str, Patient] = {}  # all patients keyed by patient id
+        self.episodes: Dict[str, Episode] = {}  # all episodes keyed by episode id
+
+    def add_patient(self, patient: Patient) -> None:  # save a new patient
+        with self._lock:  # acquire the lock before touching data
+            self.patients[patient.id] = patient  # store the patient under their id
+
+    def add_episode(self, episode: Episode) -> None:  # save a new episode
+        with self._lock:  # acquire the lock before touching data
+            self.episodes[episode.id] = episode  # store the episode under its id
+            self.patients[episode.patient_id].episodes.append(episode.id)  # link the episode to its patient's history
+
+    def get_patient(self, pid: str) -> Optional[Patient]:  # fetch one patient by id
+        with self._lock:  # acquire the lock before reading
+            return self.patients.get(pid)  # return the patient (None if missing)
+
+    def get_episode(self, eid: str) -> Optional[Episode]:  # fetch one episode by id
+        with self._lock:  # acquire the lock before reading
+            return self.episodes.get(eid)  # return the episode (None if missing)
+
+    def patient_history(self, pid: str) -> List[Episode]:  # get all episodes of a patient
+        with self._lock:  # acquire the lock before reading
+            patient = self.patients.get(pid)  # look up the patient
+            if patient is None:  # if the patient doesn't exist
+                return []  # return an empty history
+            return [self.episodes[e] for e in patient.episodes if e in self.episodes]  # map episode ids to episode objects
+
+
+STORE: Store = Store()  # the single global database instance used everywhere
+
+# ---------------------------------------------------------------------------
+# 5. HELPERS (fully annotated)
+# ---------------------------------------------------------------------------
+
+
+def _now() -> str:
+    """Return the current local time as an ISO-ish string."""  # timestamp helper
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # format now as "YYYY-MM-DD HH:MM:SS"
+
+
+def _timestamp() -> float:
+    """Return current unix time in seconds (for deadlines)."""  # unix-time helper
+    return time.time()  # seconds since epoch
+
+
+def _clean_symptoms(raw: str) -> List[str]:
+    """Split a free-text symptom string into a clean list of keywords."""  # input normalisation
+    parts = [p.strip().lower() for p in raw.replace("\n", ",").split(",")]  # split on commas/newlines, trim + lowercase each
+    return [p for p in parts if p]  # drop any empty strings
+
+
+def assess_severity(symptoms: List[str]) -> str:
+    """Classify a list of symptoms into low/medium/high/critical."""  # severity classifier
+    text = " ".join(symptoms)  # join all symptoms into one searchable string
+    for level in ("critical", "high", "medium"):  # check the most dangerous levels first
+        if any(kw in text for kw in SEVERITY_RULES[level]):  # if any keyword of this level is in the text
+            return level  # return that severity immediately
+    return "low"  # nothing matched -> classify as low
+
+
+def find_remedy(symptoms: List[str]) -> Optional[Remedy]:
+    """Return the first matching home remedy for the symptoms, or None."""  # remedy lookup
+    text = " ".join(symptoms)  # join all symptoms into one searchable string
+    for rule in REMEDY_RULES:  # loop over every known remedy rule
+        if any(kw in text for kw in rule.keywords):  # if any keyword of the rule matches
+            return rule.remedy  # return that rule's remedy
+    return None  # no rule matched -> no remedy
+
+
+def diagnosis_for(symptoms: List[str]) -> str:
+    """Return a human-readable diagnosis for the symptoms."""  # diagnosis lookup
+    text = " ".join(symptoms)  # join all symptoms into one searchable string
+    for rule in REMEDY_RULES:  # loop over every known remedy rule
+        if any(kw in text for kw in rule.keywords):  # if any keyword of the rule matches
+            return rule.diagnosis  # return that rule's diagnosis
+    return "General symptoms - advice given below"  # fallback diagnosis when nothing matches
+
+
+def estimate_cost(severity: str, symptom_count: int) -> float:
+    """Estimate treatment cost from severity + number of symptoms."""  # cost estimator
+    base = COST_BY_SEVERITY.get(severity, 150.0)  # look up the base cost for this severity
+    return round(base * (1 + 0.03 * symptom_count), 2)  # scale slightly with symptom count and round to 2 decimals
+
+
+def reaction_delay_seconds(remedy: Optional[Remedy]) -> float:
+    """Delay before auto-ambulance, based on the medicine reaction time."""  # timer length calculator
+    minutes = remedy.reaction_minutes if remedy else 30  # use the remedy's reaction time (default 30 if none)
+    if TIMER_MODE == "fast":  # in demo mode
+        return float(minutes)          # seconds for demo/testing  # count the "minutes" as seconds
+    return float(minutes) * 60.0       # real minutes in production  # convert minutes to seconds for the countdown
+
+
+def patient_to_json(patient: Patient) -> Dict[str, Any]:
+    """Convert a Patient to a JSON-serialisable dict."""  # API serializer for patients
+    return {  # build the JSON-friendly dictionary
+        "id": patient.id,  # patient's unique id
+        "name": patient.name,  # patient's name
+        "age": patient.age,  # patient's age
+        "weight_kg": patient.weight_kg,  # patient's weight
+        "blood_group": patient.blood_group,  # patient's blood group
+        "allergies": patient.allergies,  # patient's allergies
+        "contacts": [{"name": c.name, "phone": c.phone, "relation": c.relation}  # each contact as a dict
+                     for c in patient.contacts],  # loop over all contacts
+        "created_at": patient.created_at,  # profile creation time
+        "episodes": patient.episodes,  # list of episode ids
+    }
+
+
+def episode_to_json(episode: Episode) -> Dict[str, Any]:
+    """Convert an Episode to a JSON-serialisable dict (what friends consume)."""  # API serializer for episodes
+    return {  # build the JSON-friendly dictionary
+        "id": episode.id,  # episode's unique id
+        "patient_id": episode.patient_id,  # owning patient id
+        "symptoms": episode.symptoms,  # reported symptoms
+        "severity": episode.severity,          # <-- the key field friends use  # severity is the critical data for friends' code
+        "diagnosis": episode.diagnosis,  # diagnosis text
+        "remedy": episode.remedy,  # medicine details (or None)
+        "estimated_cost": episode.est_cost,  # estimated treatment cost
+        "insurance_status": episode.insurance_status,  # insurance flow state
+        "status": episode.status,  # lifecycle state
+        "created_at": episode.created_at,  # when the episode was created
+        "deadline_ts": episode.deadline_ts,  # remedy timer deadline (or None)
+        "actions": episode.actions,  # audit-trail timeline
+    }
+
+
+def notify_external(kind: str, payload: Dict[str, Any]) -> None:
+    """
+    Outbound integration hook.
+
+    This is the SINGLE place where your friends' code plugs in.  When kind is
+    "hospital", "contacts" or "ambulance", this function should POST the
+    patient + severity payload to their endpoints.  Until the URLs in section
+    2 are filled in, it only simulates the call in the terminal.
+    """  # the plug-in point for friends' code
+    urls = {"hospital": HOSPITAL_API_URL, "contacts": CONTACT_SMS_API_URL,  # map notification kind to its URL
+            "ambulance": AMBULANCE_API_URL}  # ambulance URL in the same map
+    url = urls.get(kind, "")  # get the URL for this kind (empty if not configured)
+    if url:  # if a real URL is configured
+        try:  # attempt the external call
+            _post_json(url, payload)  # POST the payload to the friend's endpoint
+            print(f"[integration] POST {kind} -> {url} OK")  # log success
+        except Exception as exc:  # noqa: BLE001 - integration must never crash the app  # swallow any error so the app keeps running
+            print(f"[integration] POST {kind} -> {url} FAILED: {exc}")  # log the failure
+    else:  # no URL configured -> simulate
+        print(f"[simulated] {kind.upper()} notification sent (plug INTEGRATION URLS): {payload}")  # log the simulated call
+
+
+def _post_json(url: str, payload: Dict[str, Any]) -> None:
+    """Minimal JSON POST without adding a 'requests' dependency."""  # tiny HTTP POST helper
+    import json  # json module for serialization
+    import urllib.request  # built-in HTTP client
+
+    req = urllib.request.Request(  # build an HTTP request object
+        url,  # the target URL
+        data=json.dumps(payload).encode("utf-8"),  # serialize payload to JSON bytes
+        headers={"Content-Type": "application/json"},  # tell the server we send JSON
+        method="POST",  # use the POST verb
+    )
+    with urllib.request.urlopen(req, timeout=5):  # noqa: S310 - local network integration  # send the request (max 5s)
+        pass  # we don't need the response body
+
+
+# ---------------------------------------------------------------------------
+# 6. FLASK APP
+# ---------------------------------------------------------------------------
+
+app = Flask(__name__)  # create the Flask web application
+app.secret_key = SECRET_KEY  # key used to sign session cookies
+
+
+@app.after_request  # runs after every response
+def _cors_headers(response: Any) -> Any:
+    """
+    Allow friends' frontends/code on other origins to call this JSON API
+    (browser CORS).  API routes can be reached from any origin.
+    """  # enables cross-origin access for friends' browser code
+    if request.path.startswith("/api"):  # only for API routes
+        response.headers["Access-Control-Allow-Origin"] = "*"  # allow any origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"  # allowed HTTP methods
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"  # allowed headers
+    return response  # pass the response back
+
+
+@app.route("/api/<path:_>", methods=["OPTIONS"])  # catch all OPTIONS preflight requests under /api
+def _api_options(_: str) -> Any:
+    """Answer CORS preflight requests from friends' frontends."""  # preflight handler
+    return ("", 204, {"Access-Control-Allow-Origin": "*",  # empty 204 response allowing any origin
+                      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",  # allowed methods
+                      "Access-Control-Allow-Headers": "Content-Type"})  # allowed headers
+
+
+# --------------------------- Web routes ------------------------------------
+
+@app.route("/")  # the root URL
+def home() -> Any:
+    """Landing page or dashboard depending on session."""  # entry page for the browser
+    if session.get("patient_id") in STORE.patients:  # if the browser already has a logged-in patient
+        return redirect(url_for("dashboard"))  # go straight to the dashboard
+    return render_template_string(TEMPLATE, page="landing")  # otherwise show the registration page
+
+
+@app.route("/register", methods=["POST"])  # handle the registration form submit
+def register() -> Any:
+    """Create a personalised patient profile."""  # registration handler
+    name = request.form.get("name", "").strip()  # read + trim the name from the form
+    if not name:  # a name is required
+        return redirect(url_for("home"))  # bounce back to the landing page
+
+    age = int(request.form.get("age", "0") or 0)  # read age (default 0)
+    weight = float(request.form.get("weight", "0") or 0)  # read weight (default 0)
+    blood = request.form.get("blood", "Unknown").strip()  # read blood group
+    allergies = [a.strip() for a in request.form.get("allergies", "").split(",") if a.strip()]  # split + trim the allergy list
+
+    contacts: List[Contact] = []  # start with an empty contact list
+    for i in (1, 2):  # support up to two emergency contacts
+        cname = request.form.get(f"contact{i}_name", "").strip()  # contact name field
+        cphone = request.form.get(f"contact{i}_phone", "").strip()  # contact phone field
+        crelation = request.form.get(f"contact{i}_relation", "").strip()  # contact relation field
+        if cname or cphone:  # only add if at least a name or phone was given
+            contacts.append(Contact(cname or "Contact", cphone or "N/A", crelation or "Emergency"))  # build + store the contact
+
+    patient = Patient(id=uuid.uuid4().hex[:10], name=name, age=age, weight_kg=weight,  # build a new Patient with a random id
+                      blood_group=blood, allergies=allergies, contacts=contacts,  # pass the rest of the profile data
+                      created_at=_now())  # stamp the creation time
+    STORE.add_patient(patient)  # save the patient in the database
+    session["patient_id"] = patient.id  # remember this patient in the browser session
+    return redirect(url_for("dashboard"))  # send them to the dashboard
+
+
+@app.route("/dashboard")  # the main "start a new problem" page
+def dashboard() -> Any:
+    """Start-a-new-problem screen with symptom input."""  # dashboard handler
+    patient = STORE.get_patient(session.get("patient_id", ""))  # load the logged-in patient
+    if patient is None:  # no valid patient in session
+        return redirect(url_for("home"))  # redirect to registration
+    return render_template_string(TEMPLATE, page="dashboard", patient=patient)  # render the dashboard template with the patient
+
+
+@app.route("/episode/new", methods=["POST"])  # handle the symptom submission
+def new_episode() -> Any:
+    """Assess a new problem, apply remedy or critical path, record everything."""  # core problem-assessment handler
+    patient = STORE.get_patient(session.get("patient_id", ""))  # load the logged-in patient
+    if patient is None:  # no valid patient in session
+        return redirect(url_for("home"))  # redirect to registration
+
+    symptoms = _clean_symptoms(request.form.get("symptoms", ""))  # read + clean the symptom text
+    if not symptoms:  # nothing was entered
+        return redirect(url_for("dashboard"))  # go back to the dashboard
+
+    severity = assess_severity(symptoms)  # classify the severity
+    remedy = find_remedy(symptoms)  # find the matching home remedy
+    diagnosis = diagnosis_for(symptoms)  # get the diagnosis text
+    cost = estimate_cost(severity, len(symptoms))  # estimate the treatment cost
+
+    episode = Episode(  # build a new Episode object
+        id=uuid.uuid4().hex[:10],  # random episode id
+        patient_id=patient.id,  # owning patient
+        symptoms=symptoms,  # the cleaned symptoms
+        severity=severity,  # classified severity
+        diagnosis=diagnosis,  # diagnosis text
+        remedy={"medicine": remedy.medicine, "dosage": remedy.dosage,  # remedy dict (medicine name + dosage
+                "reaction_minutes": remedy.reaction_minutes, "note": remedy.note,  # reaction time + advice
+                "price": remedy.price} if remedy else None,  # price, or None if no remedy
+        est_cost=cost,  # estimated cost
+        status="remedy_active" if severity in ("low", "medium") else "hospital_notified",  # low/medium start with remedy active; otherwise hospital alert
+        created_at=_now(),  # timestamp the episode
+        deadline_ts=_timestamp() + reaction_delay_seconds(remedy) if remedy  # timer = now + reaction delay (only for low/medium)
+        and severity in ("low", "medium") else None,  # no timer for high/critical
+    )
+
+    episode.actions.append({"ts": _now(), "type": "assess",  # log the initial assessment step
+                            "message": f"Symptoms: {', '.join(symptoms)} | Severity: {severity.upper()}"})  # record what was reported and classified
+    if severity in ("low", "medium") and remedy:  # if we can give a home remedy
+        episode.actions.append({"ts": _now(), "type": "remedy",  # log the remedy step
+                                "message": f"Prescribed {remedy.medicine} ({remedy.dosage}). Reaction window: "  # record the prescription
+                                           f"~{remedy.reaction_minutes} min."})  # note the reaction window length
+    if severity in ("high", "critical"):  # if it is serious
+        episode.actions.append({"ts": _now(), "type": "hospital",  # log the hospital alert
+                                "message": f"CRITICAL ALERT sent to {DEFAULT_HOSPITAL}. Ambulance: {AMBULANCE_PHONE}."})  # record hospital + ambulance line
+        episode.actions.append({"ts": _now(), "type": "contacts",  # log the contacts alert
+                                "message": "Emergency contacts notified (simulated)."})  # record contact notification
+        notify_external("hospital", _base_payload(patient, episode))  # notify friends' hospital code
+        notify_external("contacts", _base_payload(patient, episode))  # notify friends' contact/SMS code
+    if severity == "critical":  # for the worst cases
+        episode.actions.append({"ts": _now(), "type": "ambulance",  # log the ambulance dispatch
+                                "message": f"Ambulance dispatched via {AMBULANCE_PHONE}."})  # record the dispatch
+        episode.status = "ambulance_dispatched"  # mark the episode as ambulance dispatched
+        notify_external("ambulance", _base_payload(patient, episode))  # notify friends' ambulance code
+    if cost > INSURANCE_COVER_LIMIT and severity in ("high", "critical"):  # if the bill exceeds the insurance limit
+        episode.insurance_status = "offered"  # mark insurance as offered
+        episode.actions.append({"ts": _now(), "type": "insurance",  # log the insurance offer
+                                "message": f"Estimated cost {cost:.2f} exceeds cover {INSURANCE_COVER_LIMIT:.2f} - insurance offered."})  # record cost vs cover
+
+    STORE.add_episode(episode)  # save the new episode
+    return redirect(url_for("episode_page", eid=episode.id))  # show the result page
+
+
+def _base_payload(patient: Patient, episode: Episode) -> Dict[str, Any]:
+    """Shared payload sent to friends' integration endpoints."""  # common webhook payload builder
+    return {  # build the payload
+        "event": "medical_assistance",  # what happened
+        "patient": patient_to_json(patient),  # full patient info
+        "episode": episode_to_json(episode),  # full episode info
+        "severity": episode.severity,  # severity (the key field for friends)
+        "hospital": DEFAULT_HOSPITAL,  # which hospital to alert
+        "ambulance_phone": AMBULANCE_PHONE,  # the ambulance number
+    }
+
+
+@app.route("/episode/<eid>")  # the per-episode result page
+def episode_page(eid: str) -> Any:
+    """Result page: criticality view or remedy view (with countdown)."""  # result page handler
+    patient = STORE.get_patient(session.get("patient_id", ""))  # load the logged-in patient
+    episode = STORE.get_episode(eid)  # load the requested episode
+    if patient is None or episode is None or episode.patient_id != patient.id:  # episode must belong to this patient
+        return redirect(url_for("home"))  # otherwise redirect away
+    _auto_ambulance_sweep(episode)  # check if the remedy timer already expired (page load trigger)
+    return render_template_string(TEMPLATE, page="episode", patient=patient,  # render the episode page
+                                  episode=episode, cover=INSURANCE_COVER_LIMIT)  # pass episode + insurance limit
+
+
+@app.route("/episode/<eid>/resolve", methods=["POST"])  # "feeling better" button
+def resolve_episode(eid: str) -> Any:
+    """Patient says the remedy worked -> close the problem safely."""  # resolve handler
+    episode = _owned_episode(eid)  # get the episode if it belongs to the session patient
+    if episode and episode.status == "remedy_active":  # only resolvable while the remedy is active
+        episode.status = "resolved"  # mark resolved
+        episode.deadline_ts = None  # clear the timer
+        episode.actions.append({"ts": _now(), "type": "resolve",  # log the resolution
+                                "message": "Patient confirmed the remedy worked. Problem resolved."})  # record outcome
+    return redirect(url_for("episode_page", eid=eid))  # reload the episode page
+
+
+@app.route("/episode/<eid>/ambulance", methods=["POST"])  # emergency / auto-timer trigger
+def ambulance_episode(eid: str) -> Any:
+    """Emergency / timer-expiry -> dispatch ambulance immediately."""  # ambulance dispatch handler
+    episode = _owned_episode(eid)  # get the episode if it belongs to the session patient
+    if episode and episode.status not in ("resolved",):  # don't dispatch if already resolved
+        patient = STORE.get_patient(episode.patient_id)  # load the patient
+        episode.status = "ambulance_dispatched"  # mark as dispatched
+        episode.deadline_ts = None  # clear the timer
+        episode.actions.append({"ts": _now(), "type": "ambulance",  # log the dispatch
+                                "message": f"AMBULANCE dispatched via {AMBULANCE_PHONE}."})  # record the dispatch event
+        if patient:  # only notify if we have the patient
+            notify_external("ambulance", _base_payload(patient, episode))  # notify friends' ambulance code
+    return redirect(url_for("episode_page", eid=eid))  # reload the episode page
+
+
+@app.route("/episode/<eid>/hospital", methods=["POST"])  # test button to re-notify the hospital
+def hospital_episode(eid: str) -> Any:
+    """Manually re-notify the hospital (test button)."""  # hospital test handler
+    episode = _owned_episode(eid)  # get the episode if it belongs to the session patient
+    if episode:  # only if the episode exists
+        patient = STORE.get_patient(episode.patient_id)  # load the patient
+        episode.actions.append({"ts": _now(), "type": "hospital",  # log the re-notification
+                                "message": f"Hospital re-notified ({DEFAULT_HOSPITAL})."})  # record the action
+        if patient:  # only notify if we have the patient
+            notify_external("hospital", _base_payload(patient, episode))  # notify friends' hospital code
+    return redirect(url_for("episode_page", eid=eid))  # reload the episode page
+
+
+@app.route("/episode/<eid>/contacts", methods=["POST"])  # test button to re-call emergency contacts
+def contacts_episode(eid: str) -> Any:
+    """Manually call emergency contacts again (test button)."""  # contacts test handler
+    episode = _owned_episode(eid)  # get the episode if it belongs to the session patient
+    if episode:  # only if the episode exists
+        patient = STORE.get_patient(episode.patient_id)  # load the patient
+        episode.actions.append({"ts": _now(), "type": "contacts",  # log the re-call
+                                "message": "Emergency contacts re-called (simulated)."})  # record the action
+        if patient:  # only notify if we have the patient
+            notify_external("contacts", _base_payload(patient, episode))  # notify friends' SMS code
+    return redirect(url_for("episode_page", eid=eid))  # reload the episode page
+
+
+@app.route("/episode/<eid>/insurance", methods=["POST"])  # the insurance yes/no buttons
+def insurance_episode(eid: str) -> Any:
+    """Patient answers the insurance prompt (yes/no)."""  # insurance answer handler
+    episode = _owned_episode(eid)  # get the episode if it belongs to the session patient
+    if episode:  # only if the episode exists
+        choice = request.form.get("choice", "no")  # read the patient's answer
+        episode.insurance_status = "applied" if choice == "yes" else "declined"  # update the insurance state
+        episode.actions.append({"ts": _now(), "type": "insurance",  # log the decision
+                                "message": "Insurance application submitted." if choice == "yes"  # message for applying
+                                else "Patient declined insurance."})  # message for declining
+    return redirect(url_for("episode_page", eid=eid))  # reload the episode page
+
+
+@app.route("/episode/<eid>/advance", methods=["POST"])  # developer-only test button
+def advance_timer(eid: str) -> Any:
+    """DEV ONLY: make the reaction timer expire now to test auto-ambulance."""  # demo helper
+    episode = _owned_episode(eid)  # get the episode if it belongs to the session patient
+    if episode:  # only if the episode exists
+        episode.deadline_ts = _timestamp() - 1  # set the deadline to the past so the sweep fires immediately
+    return redirect(url_for("episode_page", eid=eid))  # reload the episode page
+
+
+@app.route("/history")  # the history page
+def history() -> Any:
+    """Full history of every problem and what happened."""  # history handler
+    patient = STORE.get_patient(session.get("patient_id", ""))  # load the logged-in patient
+    if patient is None:  # no valid patient
+        return redirect(url_for("home"))  # redirect to registration
+    episodes = sorted(STORE.patient_history(patient.id),  # get all episodes and sort them
+                      key=lambda e: e.created_at, reverse=True)  # newest first by creation time
+    return render_template_string(TEMPLATE, page="history", patient=patient, episodes=episodes)  # render the history template
+
+
+@app.route("/logout")  # logout link
+def logout() -> Any:
+    """Forget the current patient (keeps stored data)."""  # logout handler
+    session.clear()  # clear the browser session cookie
+    return redirect(url_for("home"))  # back to the landing page
+
+
+def _owned_episode(eid: str) -> Optional[Episode]:
+    """Return the episode if it belongs to the logged-in patient."""  # ownership guard
+    patient = STORE.get_patient(session.get("patient_id", ""))  # load the logged-in patient
+    episode = STORE.get_episode(eid)  # load the requested episode
+    if patient is None or episode is None or episode.patient_id != patient.id:  # must belong to this patient
+        return None  # not allowed -> return None
+    return episode  # allowed -> return the episode
+
+
+def _auto_ambulance_sweep(episode: Episode) -> None:
+    """If the remedy deadline passed, dispatch the ambulance automatically."""  # timer expiry check
+    if (episode.status == "remedy_active" and episode.deadline_ts  # only active remedy episodes with a deadline
+            and _timestamp() >= episode.deadline_ts):  # and the deadline has passed
+        patient = STORE.get_patient(episode.patient_id)  # load the patient
+        episode.status = "ambulance_dispatched"  # mark as dispatched
+        episode.deadline_ts = None  # clear the timer
+        episode.actions.append({"ts": _now(), "type": "ambulance",  # log the auto-dispatch
+                                "message": "Remedy did NOT work within the reaction window - "  # record why
+                                           f"AMBULANCE auto-dispatched ({AMBULANCE_PHONE})."})  # record the ambulance line
+        if patient:  # only notify if we have the patient
+            notify_external("ambulance", _base_payload(patient, episode))  # notify friends' ambulance code
+
+
+def background_sweeper() -> None:
+    """Background thread: auto-ambulance even when nobody visits the page."""  # the watchdog thread
+    while True:  # run forever
+        time.sleep(SWEEP_INTERVAL)  # wait between checks
+        for eid in list(STORE.episodes):  # iterate over a snapshot of all episodes
+            episode = STORE.get_episode(eid)  # fetch each episode
+            if episode:  # if it exists
+                _auto_ambulance_sweep(episode)  # check its timer and auto-dispatch if expired
+
+
+# --------------------------- JSON API (for friends) -------------------------
+
+@app.route("/api/health")  # simple health check endpoint
+def api_health() -> Any:
+    """Check the service is up."""  # health check handler
+    return jsonify({"service": APP_NAME, "status": "ok", "time": _now(),  # return status info
+                    "insurance_cover_limit": INSURANCE_COVER_LIMIT})  # include the insurance threshold
+
+
+@app.route("/api/contract")  # machine-readable API documentation endpoint
+def api_contract() -> Any:
+    """API contract for friends' code: what to call to get info + severity."""  # contract handler
+    return jsonify({  # return the full API description
+        "app": APP_NAME,  # app name
+        "version": "1.0",  # contract version
+        "how_it_works": "Friends' hospital / emergency-contact / ambulance code "  # explanation for friends
+                        "reads GET endpoints to fetch data, and is notified by "  # reads our API
+                        "Health 360 via POST to the URLs set in section 2 "  # and receives our webhooks
+                        "(HOSPITAL_API_URL, AMBULANCE_API_URL, CONTACT_SMS_API_URL).",  # which URLs to set
+        "endpoints": {  # list of our JSON endpoints
+            "assess_symptoms": {"method": "POST", "path": "/api/severity",  # severity endpoint
+                                "body": {"symptoms": ["chest pain"], "patient_id": "optional"},  # example body
+                                "returns": "severity, diagnosis, remedy, action"},  # what it returns
+            "create_patient": {"method": "POST", "path": "/api/patients",  # patient creation endpoint
+                               "body": {"name": "...", "age": 30, "contacts": []}},  # example body
+            "get_patient": {"method": "GET", "path": "/api/patients/<id>"},  # fetch one patient
+            "get_history": {"method": "GET", "path": "/api/patients/<id>/history"},  # fetch a patient's history
+            "get_episode": {"method": "GET", "path": "/api/episodes/<id>"},  # fetch one episode
+            "trigger_action": {"method": "POST", "path": "/api/episodes/<id>/actions",  # trigger actions remotely
+                               "body": {"action": "ambulance|hospital|contacts|resolve|insurance",  # allowed actions
+                                        "choice": "yes|no"}},  # optional choice for insurance
+        },
+        "webhooks_we_call": {  # the notifications Health 360 sends out
+            "HOSPITAL_API_URL": "POST patient + severity when severity is high/critical",  # hospital hook
+            "CONTACT_SMS_API_URL": "POST emergency contacts when severity is high/critical",  # SMS hook
+            "AMBULANCE_API_URL": "POST when user hits emergency, timer expires, or severity critical",  # ambulance hook
+        },
+        "severity_values": ["low", "medium", "high", "critical"],  # the possible severity values
+    })
+
+
+@app.route("/api/patients", methods=["POST"])  # create a patient via JSON
+def api_create_patient() -> Any:
+    """Create a patient from JSON (what friends use to register a user)."""  # API patient creation
+    data = request.get_json(silent=True) or {}  # parse the JSON body (empty dict if invalid)
+    name = str(data.get("name", "")).strip()  # read + trim the name
+    if not name:  # name is required
+        return jsonify({"error": "name is required"}), 400  # return a 400 error
+    contacts = [Contact(str(c.get("name", "")), str(c.get("phone", "")),  # build Contact objects from JSON
+                        str(c.get("relation", ""))) for c in data.get("contacts", [])]  # one per contact entry
+    patient = Patient(id=uuid.uuid4().hex[:10], name=name,  # build a new Patient with a random id
+                      age=int(data.get("age", 0) or 0),  # age from JSON (default 0)
+                      weight_kg=float(data.get("weight_kg", 0) or 0),  # weight from JSON (default 0)
+                      blood_group=str(data.get("blood_group", "Unknown")),  # blood group from JSON
+                      allergies=[str(a) for a in data.get("allergies", [])],  # allergies list from JSON
+                      contacts=contacts, created_at=_now())  # contacts + creation time
+    STORE.add_patient(patient)  # save the patient
+    return jsonify(patient_to_json(patient)), 201  # return the created patient with HTTP 201
+
+
+@app.route("/api/severity", methods=["POST"])  # the MAIN assessment endpoint
+def api_severity() -> Any:
+    """
+    The MAIN endpoint friends call. Send symptoms, get severity + advice.
+    Body: {"symptoms": ["chest pain"], "patient_id": "optional"}
+    """  # severity assessment API
+    data = request.get_json(silent=True) or {}  # parse the JSON body
+    symptoms = [str(s).lower() for s in data.get("symptoms", [])]  # read + lowercase the symptoms list
+    if not symptoms:  # symptoms are required
+        return jsonify({"error": "symptoms are required"}), 400  # return a 400 error
+
+    severity = assess_severity(symptoms)  # classify severity
+    remedy = find_remedy(symptoms)  # find the remedy
+    diagnosis = diagnosis_for(symptoms)  # get the diagnosis
+    cost = estimate_cost(severity, len(symptoms))  # estimate cost
+
+    payload = {  # build the response
+        "severity": severity,  # the severity level (friends' key field)
+        "diagnosis": diagnosis,  # diagnosis text
+        "estimated_cost": cost,  # estimated cost
+        "insurance_needed": cost > INSURANCE_COVER_LIMIT,  # whether insurance is needed
+        "recommendation": ("IMMEDIATE HOSPITAL" if severity in ("high", "critical")  # advice for serious cases
+                           else "home remedy"),  # advice for mild cases
+        "remedy": {"medicine": remedy.medicine, "dosage": remedy.dosage,  # remedy details
+                   "reaction_minutes": remedy.reaction_minutes,  # reaction time (for the timer)
+                   "note": remedy.note} if remedy else None,  # advice note, or None if no remedy
+        "action": ("hospital" if severity in ("high", "critical") else "remedy"),  # recommended next action
+    }
+    if data.get("patient_id"):  # if a patient id was supplied
+        # attach the patient profile (or None if the id is unknown)
+        payload["patient"] = patient_to_json(STORE.get_patient(data["patient_id"])) \
+            if STORE.get_patient(data["patient_id"]) else None
+    return jsonify(payload)  # return the assessment
+
+
+@app.route("/api/patients/<pid>")  # fetch one patient by id
+def api_patient(pid: str) -> Any:
+    """Return one patient's profile."""  # patient fetch handler
+    patient = STORE.get_patient(pid)  # look up the patient
+    if patient is None:  # not found
+        return jsonify({"error": "patient not found"}), 404  # return 404
+    return jsonify(patient_to_json(patient))  # return the serialized patient
+
+
+@app.route("/api/patients/<pid>/history")  # fetch a patient's episode history
+def api_history(pid: str) -> Any:
+    """Return the full history of a patient (all episodes + actions)."""  # history API handler
+    patient = STORE.get_patient(pid)  # look up the patient
+    if patient is None:  # not found
+        return jsonify({"error": "patient not found"}), 404  # return 404
+    episodes = sorted(STORE.patient_history(pid), key=lambda e: e.created_at, reverse=True)  # get + sort history newest-first
+    return jsonify([episode_to_json(e) for e in episodes])  # return the list of episodes
+
+
+@app.route("/api/episodes/<eid>")  # fetch one episode by id
+def api_episode(eid: str) -> Any:
+    """Return one episode (with severity + actions)."""  # episode fetch handler
+    episode = STORE.get_episode(eid)  # look up the episode
+    if episode is None:  # not found
+        return jsonify({"error": "episode not found"}), 404  # return 404
+    return jsonify(episode_to_json(episode))  # return the serialized episode
+
+
+@app.route("/api/episodes/<eid>/actions", methods=["POST"])  # remote action trigger for friends
+def api_episode_action(eid: str) -> Any:
+    """Friends trigger actions: hospital | contacts | ambulance | resolve | insurance."""  # action API handler
+    episode = STORE.get_episode(eid)  # look up the episode
+    if episode is None:  # not found
+        return jsonify({"error": "episode not found"}), 404  # return 404
+    data = request.get_json(silent=True) or {}  # parse the JSON body
+    if isinstance(data, str):  # tolerate a bare string body
+        action = data.strip().lower()  # treat the whole body as the action
+        data = {}  # reset data to an empty dict
+    else:  # normal dict body
+        action = str(data.get("action", "")).strip().lower()  # read the action field
+
+    patient = STORE.get_patient(episode.patient_id)  # load the episode's patient
+    if action == "ambulance":  # dispatch the ambulance
+        episode.status = "ambulance_dispatched"  # mark dispatched
+        episode.deadline_ts = None  # clear the timer
+        episode.actions.append({"ts": _now(), "type": "ambulance",  # log it
+                                "message": "Ambulance dispatched via API."})  # record the event
+        notify_external("ambulance", _base_payload(patient, episode) if patient else {})  # notify friends' ambulance code
+    elif action == "hospital":  # notify the hospital
+        episode.actions.append({"ts": _now(), "type": "hospital",  # log it
+                                "message": "Hospital notified via API."})  # record the event
+        notify_external("hospital", _base_payload(patient, episode) if patient else {})  # notify friends' hospital code
+    elif action == "contacts":  # call the emergency contacts
+        episode.actions.append({"ts": _now(), "type": "contacts",  # log it
+                                "message": "Emergency contacts called via API."})  # record the event
+        notify_external("contacts", _base_payload(patient, episode) if patient else {})  # notify friends' SMS code
+    elif action == "resolve":  # mark the episode resolved
+        episode.status = "resolved"  # set resolved
+        episode.deadline_ts = None  # clear the timer
+        episode.actions.append({"ts": _now(), "type": "resolve",  # log it
+                                "message": "Resolved via API."})  # record the event
+    elif action == "insurance":  # handle insurance choice
+        choice = data.get("choice", "no") if isinstance(data, dict) else "no"  # read the choice
+        episode.insurance_status = "applied" if choice == "yes" else "declined"  # update insurance state
+        episode.actions.append({"ts": _now(), "type": "insurance",  # log it
+                                "message": "Insurance handled via API."})  # record the event
+    else:  # unknown action
+        return jsonify({"error": f"unknown action '{action}'"}), 400  # return 400
+    return jsonify(episode_to_json(episode))  # return the updated episode
+
+
+# ---------------------------------------------------------------------------
+# 7. TEMPLATE (single embedded UI)
+# ---------------------------------------------------------------------------
+
+TEMPLATE: str = """  # the whole HTML/CSS/JS user interface embedded as one string
+<!doctype html>  # HTML5 document declaration
+<html lang="en">  # document root, language English
+<head>  # document head (metadata + styles + scripts)
+<meta charset="utf-8">  # use UTF-8 encoding (so emojis work)
+<meta name="viewport" content="width=device-width, initial-scale=1">  # responsive mobile scaling
+<title>{{ APP_NAME }}</title>  # browser tab title (Jinja injects the app name)
+<style>  # start of the CSS
+  :root{--teal:#0f766e;--teal2:#14b8a6;--bg:#eaf3f5;--card:#ffffff;--ink:#0f172a;  # CSS variables: primary colors, background, card, text
+        --muted:#64748b;--green:#16a34a;--amber:#b45309;--orange:#ea580c;--red:#dc2626;  # muted text + severity accent colors
+        --line:#e2e8f0;--radius:16px;}  # borders and the rounded-corner radius
+  *{box-sizing:border-box}  # make padding/border part of element width
+  body{margin:0;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;color:var(--ink);  # page body: no margin, clean font, dark text
+       background:linear-gradient(135deg,#e8f6f4 0%,#e3eef7 100%);min-height:100vh}  # soft teal gradient background filling the screen
+  .container{max-width:920px;margin:0 auto;padding:16px}  # centred content column with max width
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px;  # top bar: flex layout, space between items
+         flex-wrap:wrap;padding:14px 18px;background:linear-gradient(90deg,var(--teal),var(--teal2));  # teal gradient bar with padding
+         color:#fff;border-radius:0 0 var(--radius) var(--radius);box-shadow:0 4px 18px rgba(15,23,42,.15)}  # white text, rounded bottom, soft shadow
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:20px}  # app-name logo text style
+  .brand .dot{width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 0 0 4px rgba(255,255,255,.25)}  # decorative white dot with halo
+  nav a{color:#fff;text-decoration:none;margin-left:14px;padding:7px 14px;border-radius:999px;  # nav links: white, pill-shaped
+        background:rgba(255,255,255,.16);font-weight:600;font-size:14px;transition:.2s}  # translucent background + hover transition
+  nav a:hover{background:rgba(255,255,255,.32)}  # brighter pill on hover
+  .card{background:var(--card);border-radius:var(--radius);padding:24px;margin:20px 0;  # white card panels with rounded corners
+        box-shadow:0 6px 24px rgba(15,23,42,.08)}  # soft drop shadow on cards
+  h1{font-size:26px;margin:0 0 6px}  # heading-1 style
+  h2{font-size:19px;margin:0 0 12px}  # heading-2 style
+  p{line-height:1.6;margin:6px 0}  # readable paragraph spacing
+  .muted{color:var(--muted);font-size:13px}  # small grey secondary text
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}  # two-column responsive grid
+  @media(max-width:640px){.grid-2{grid-template-columns:1fr}}  # on phones, stack the grid to one column
+  label{display:block;font-weight:600;font-size:13px;margin:10px 0 4px}  # form labels above inputs
+  input,textarea,select{width:100%;padding:11px 12px;border:1.5px solid var(--line);  # form fields: full width, padded
+        border-radius:10px;font-size:15px;font-family:inherit;background:#f8fbfc;transition:.15s}  # rounded, light background
+  input:focus,textarea:focus{outline:none;border-color:var(--teal2);background:#fff}  # highlight focused fields
+  textarea{resize:vertical;min-height:90px}  # resizable symptom textarea
+  .row{display:flex;gap:10px}  # horizontal row of fields
+  .row>*{flex:1}  # each field in a row takes equal width
+  .btn{display:inline-block;border:none;cursor:pointer;text-decoration:none;text-align:center;  # base button style
+       padding:12px 20px;border-radius:999px;font-size:15px;font-weight:700;transition:.18s;  # pill-shaped, bold text
+       font-family:inherit}  # inherit the page font
+  .btn:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(15,23,42,.18)}  # lift + shadow on hover
+  .btn-primary{background:linear-gradient(90deg,var(--teal),var(--teal2));color:#fff}  # teal gradient primary button
+  .btn-danger{background:var(--red);color:#fff}  # red danger/emergency button
+  .btn-green{background:var(--green);color:#fff}  # green success button
+  .btn-ghost{background:#eef2f7;color:var(--ink)}  # light grey neutral button
+  .btn-sm{padding:8px 14px;font-size:13px}  # smaller button variant
+  .badge{display:inline-block;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:800;  # severity pill labels
+         color:#fff;letter-spacing:.4px}  # white text with slight letter spacing
+  .b-low{background:var(--green)} .b-medium{background:var(--amber)}  # green low badge, amber medium badge
+  .b-high{background:var(--orange)} .b-critical{background:var(--red)}  # orange high badge, red critical badge
+  .pulse{animation:pulse 1.4s infinite}  # repeating pulse animation
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(220,38,38,.45)}  # keyframe: start with no shadow
+                   70%{box-shadow:0 0 0 14px rgba(220,38,38,0)}100%{box-shadow:0 0 0 0 rgba(220,38,38,0)}}  # fades the red halo outward repeatedly
+  .hero{background:linear-gradient(135deg,var(--teal),#0d9488);color:#fff;text-align:center;  # landing hero banner
+        padding:38px 20px;border-radius:var(--radius);margin:20px 0}  # big padded centred panel
+  .hero h1{font-size:30px;margin:0 0 8px}  # hero heading style
+  .chip{display:inline-block;margin:4px;padding:7px 14px;border-radius:999px;cursor:pointer;  # clickable symptom chips
+        border:1.5px solid var(--line);background:#f8fbfc;font-size:13px;font-weight:600;transition:.15s}  # pill chip styling
+  .chip:hover{border-color:var(--teal2);background:#fff}  # chip highlight on hover
+  .chip.on{background:var(--teal2);border-color:var(--teal2);color:#fff}  # selected chip state
+  .countwrap{margin:14px 0}  # wrapper for the countdown
+  .countrow{display:flex;justify-content:space-between;align-items:baseline;gap:10px}  # countdown row layout
+  .timer{font-size:38px;font-weight:800;font-variant-numeric:tabular-nums}  # big tabular countdown number
+  .bar{height:12px;border-radius:999px;background:#e2e8f0;overflow:hidden;margin-top:8px}  # progress-bar track
+  .bar i{display:block;height:100%;width:100%;background:linear-gradient(90deg,var(--teal2),var(--green));  # green fill
+         transition:width 1s linear}  # smooth width animation
+  .timeline{list-style:none;margin:14px 0 0;padding:0}  # action-history timeline list
+  .timeline li{position:relative;padding:0 0 18px 26px;border-left:2px solid var(--line)}  # vertical connector line
+  .timeline li::before{content:'';position:absolute;left:-7px;top:2px;width:12px;height:12px;  # timeline dot
+        border-radius:50%;background:var(--teal2)}  # teal dot on the line
+  .timeline li .t{font-weight:700;font-size:14px}  # timeline entry title
+  .timeline li .d{color:var(--muted);font-size:12px}  # timeline entry timestamp
+  .flash{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;padding:12px 16px;  # green flash message box
+         border-radius:12px;margin:12px 0;font-size:14px}  # rounded notification box
+  .alert{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:12px 16px;  # red warning box
+         border-radius:12px;margin:12px 0;font-size:14px;font-weight:600}  # bold urgent warning
+  .remedy{border:2px solid #bbf7d0;background:#f0fdf4;border-radius:14px;padding:18px;margin:14px 0}  # green remedy card
+  .foot{text-align:center;color:var(--muted);font-size:12px;padding:18px 0 30px}  # small footer text
+  .seg{margin:8px 0}  # spacing for button segments
+</style>  # end of the CSS
+</head>  # end of document head
+<body>  # start of visible content
+<header>  # top navigation bar
+  <div class="brand"><span class="dot"></span>{{ APP_NAME }}</div>  # app logo + name
+  <nav>  # navigation links
+    <a href="{{ url_for('dashboard') }}">New problem</a>  # link to start a new problem
+    <a href="{{ url_for('history') }}">History</a>  # link to the history page
+    {% if session.get('patient_id') %}<a href="{{ url_for('logout') }}">Logout</a>{% endif %}  # logout link only when logged in
+  </nav>  # end of navigation
+</header>  # end of header
+
+<div class="container">  # main content wrapper
+{% with msgs = get_flashed_messages() %}  # grab any flashed messages
+  {% if msgs %}<div class="flash">{{ msgs[0] }}</div>{% endif %}  # show the first flash message if any
+{% endwith %}  # end flash block
+
+{% if page == 'landing' %}  # LANDING / REGISTRATION page
+  <div class="hero">  # hero banner
+    <h1>Personalized Medical Assistance</h1>  # page title
+    <p>Describe your symptoms. We assess severity, give a safe remedy with a reaction  # intro line 1
+       timer, contact the hospital / emergency contacts when needed, and offer insurance  # intro line 2
+       support - all in one place.</p>  # intro line 3
+  </div>  # end hero
+  <div class="card">  # registration form card
+    <h2>Patient registration</h2>  # form title
+    <form method="POST" action="{{ url_for('register') }}">  # form posts to the register route
+      <label>Full name *</label>  # name field label
+      <input name="name" required placeholder="e.g. Ravi Kumar">  # required name input
+      <div class="row">  # row of three fields
+        <div><label>Age</label><input name="age" type="number" min="0" placeholder="e.g. 24"></div>  # age field
+        <div><label>Weight (kg)</label><input name="weight" type="number" step="0.1" min="0" placeholder="e.g. 65"></div>  # weight field
+        <div><label>Blood group</label><input name="blood" placeholder="e.g. O+"></div>  # blood group field
+      </div>  # end row
+      <label>Allergies (comma separated)</label>  # allergies label
+      <input name="allergies" placeholder="e.g. penicillin, peanuts">  # allergies input
+      <label>Emergency contact 1</label>  # contact-1 label
+      <div class="row">  # row of contact fields
+        <input name="contact1_name" placeholder="Name">  # contact 1 name
+        <input name="contact1_phone" placeholder="Phone">  # contact 1 phone
+        <input name="contact1_relation" placeholder="Relation">  # contact 1 relation
+      </div>  # end row
+      <label>Emergency contact 2 (optional)</label>  # contact-2 label
+      <div class="row">  # row of contact fields
+        <input name="contact2_name" placeholder="Name">  # contact 2 name
+        <input name="contact2_phone" placeholder="Phone">  # contact 2 phone
+        <input name="contact2_relation" placeholder="Relation">  # contact 2 relation
+      </div>  # end row
+      <div class="seg"><button class="btn btn-primary" type="submit">Start using Health 360</button></div>  # submit button
+    </form>  # end form
+  </div>  # end card
+
+{% elif page == 'dashboard' %}  # DASHBOARD / symptom input page
+  <div class="card">  # patient summary card
+    <h2>Welcome, {{ patient.name }} 👋</h2>  # greeting with the patient name
+    <p class="muted">Age {{ patient.age }} · Blood {{ patient.blood_group }} ·  # summary line 1
+       Weight {{ patient.weight_kg }} kg · Allergies: {{ patient.allergies or 'none' }}</p>  # summary line 2
+  </div>  # end card
+  <div class="card">  # symptom entry card
+    <h2>What is the problem?</h2>  # card title
+    <form method="POST" action="{{ url_for('new_episode') }}">  # form posts to the new episode route
+      <label>Describe your symptoms (comma separated)</label>  # textarea label
+      <textarea id="symptoms" name="symptoms" placeholder="e.g. high fever, headache, body pain"></textarea>  # symptom textarea
+      <div style="margin-top:10px">  # quick-pick section
+        <span class="muted">Quick pick: </span>  # label for chips
+        <span class="chip" onclick="addSym('fever',this)">Fever</span>  # fever chip
+        <span class="chip" onclick="addSym('headache',this)">Headache</span>  # headache chip
+        <span class="chip" onclick="addSym('cough',this)">Cough</span>  # cough chip
+        <span class="chip" onclick="addSym('sore throat',this)">Sore throat</span>  # sore throat chip
+        <span class="chip" onclick="addSym('stomach pain',this)">Stomach pain</span>  # stomach pain chip
+        <span class="chip" onclick="addSym('tired',this)">Tired</span>  # tired chip
+        <span class="chip" onclick="addSym('nausea',this)">Nausea</span>  # nausea chip
+        <span class="chip" onclick="addSym('difficulty breathing',this)">Difficulty breathing</span>  # difficulty breathing chip
+        <span class="chip" onclick="addSym('chest pain',this)">Chest pain</span>  # chest pain chip
+      </div>  # end chips
+      <div class="seg"><button class="btn btn-primary" type="submit">Check severity</button></div>  # submit button
+    </form>  # end form
+  </div>  # end card
+  <script>  # small JS for the chips
+    function addSym(sym, el){  # function: add a symptom to the textarea
+      var t = document.getElementById('symptoms');  # get the symptoms textarea
+      var v = t.value.trim();  # read its current value
+      t.value = v ? v + ', ' + sym : sym;  # append the symptom (or set it if empty)
+      [].forEach.call(document.querySelectorAll('.chip'), function(c){ c.classList.remove('on'); });  # clear all selected chips
+      el.classList.add('on');  # highlight the clicked chip
+    }  # end function
+  </script>  # end script
+
+{% elif page == 'episode' %}  # EPISODE RESULT page
+  <div class="card">  # episode summary card
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">  # title row
+      <h2 style="margin:0">Case #{{ episode.id }} — <span class="badge b-{{ episode.severity }}">{{ episode.severity|upper }}</span>  # case id + severity badge
+        {% if episode.status == 'ambulance_dispatched' %}<span class="badge b-critical" style="margin-left:6px">AMBULANCE</span>{% endif %}  # ambulance badge if dispatched
+        {% if episode.status == 'resolved' %}<span class="badge b-low" style="margin-left:6px">RESOLVED</span>{% endif %}  # resolved badge if resolved
+      </h2>  # end heading
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('dashboard') }}">+ New problem</a>  # start-a-new-problem button
+    </div>  # end title row
+    <p class="muted">{{ episode.created_at }} · Diagnosis: {{ episode.diagnosis }}</p>  # time + diagnosis
+    <p><b>Symptoms:</b> {{ ', '.join(episode.symptoms) }}</p>  # listed symptoms
+  </div>  # end card
+
+  {% if episode.severity in ('high','critical') %}  # CRITICALITY section for serious cases
+    <div class="alert pulse" style="text-align:center;font-size:17px">  # pulsing red alert
+      ⚠ IMMEDIATE MEDICAL ATTENTION REQUIRED ⚠  # urgent warning text
+    </div>  # end alert
+    <div class="card">  # hospital action card
+      <h2>🚑 Hospital & emergency action</h2>  # card title
+      <p>Alert sent to <b>{{ 'City General Hospital' }}</b> · Ambulance line <b>{{ '108' }}</b></p>  # which hospital + ambulance line
+      <div class="grid-2">  # two action buttons
+        <form method="POST" action="{{ url_for('hospital_episode', eid=episode.id) }}">  # hospital test form
+          <button class="btn btn-danger btn-sm" style="width:100%" type="submit">Test: Notify hospital</button>  # hospital test button
+        </form>  # end form
+        <form method="POST" action="{{ url_for('contacts_episode', eid=episode.id) }}">  # contacts test form
+          <button class="btn btn-primary btn-sm" style="width:100%" type="submit">Test: Call emergency contacts</button>  # contacts test button
+        </form>  # end form
+      </div>  # end buttons
+      {% if patient.contacts %}  # if the patient has contacts
+        <p class="muted">Emergency contacts on file:</p>  # contacts label
+        <ul style="margin:4px 0 0;padding-left:20px">  # contact list
+          {% for ct in patient.contacts %}  # loop over contacts
+            <li>{{ ct.name }} ({{ ct.relation }}) — {{ ct.phone }}</li>  # show name, relation, phone
+          {% endfor %}  # end loop
+        </ul>  # end list
+      {% endif %}  # end contacts block
+      {% if episode.insurance_status == 'offered' %}  # if insurance was offered
+        <div style="background:#fffbeb;border:1.5px solid #fde68a;border-radius:14px;padding:16px;margin-top:16px">  # amber insurance card
+          <h2 style="font-size:16px">💳 Insurance support</h2>  # insurance title
+          <p>Estimated cost <b>₹ {{ '%.2f'|format(episode.est_cost) }}</b> is above your insurance cover  # cost vs cover line 1
+             of <b>₹ {{ '%.2f'|format(cover) }}</b>.</p>  # cost vs cover line 2
+          <p>Would you like to apply for insurance now?</p>  # the insurance question
+          <div class="row">  # yes/no buttons
+            <form method="POST" action="{{ url_for('insurance_episode', eid=episode.id) }}" style="flex:1">  # yes form
+              <input type="hidden" name="choice" value="yes">  # hidden "yes" value
+              <button class="btn btn-green btn-sm" style="width:100%" type="submit">Yes, apply for insurance</button>  # apply button
+            </form>  # end form
+            <form method="POST" action="{{ url_for('insurance_episode', eid=episode.id) }}" style="flex:1">  # no form
+              <input type="hidden" name="choice" value="no">  # hidden "no" value
+              <button class="btn btn-ghost btn-sm" style="width:100%" type="submit">No, pay directly</button>  # decline button
+            </form>  # end form
+          </div>  # end buttons
+        </div>  # end insurance card
+      {% elif episode.insurance_status == 'applied' %}  # insurance already applied
+        <p style="background:#f0fdf4;border:1px solid #bbf7d0;padding:10px 14px;border-radius:12px">  # green confirmation box
+          ✅ Insurance application submitted.</p>  # applied message
+      {% elif episode.insurance_status == 'declined' %}  # insurance declined
+        <p style="background:#f1f5f9;border:1px solid #e2e8f0;padding:10px 14px;border-radius:12px">  # grey note box
+          Insurance declined — direct payment noted.</p>  # declined message
+      {% endif %}  # end insurance states
+    </div>  # end hospital card
+  {% endif %}  # end criticality section
+
+  {% if episode.severity in ('low','medium') %}  # REMEDY section for mild cases
+    <div class="card">  # remedy card
+      <h2>🧪 Recommended remedy</h2>  # card title
+      <div class="remedy">  # green remedy box
+        <h2 style="margin:0 0 4px">{{ episode.remedy.medicine }}</h2>  # medicine name
+        <p class="muted">{{ episode.remedy.dosage }} · {{ episode.remedy.category }}</p>  # dosage + category
+        <p>{{ episode.remedy.note }}</p>  # advice note
+      </div>  # end remedy box
+
+      {% if episode.status == 'remedy_active' %}  # while the remedy timer is running
+        <div class="countwrap">  # countdown wrapper
+          <div class="countrow">  # countdown row
+            <div>  # timer side
+              <span class="muted">Reaction window (take your medicine now):</span><br>  # instructions label
+              <span class="timer" id="countdown"  # big countdown element
+                    data-deadline="{{ episode.deadline_ts }}"  # deadline injected into the element
+                    data-url="{{ url_for('ambulance_episode', eid=episode.id) }}">--:--</span>  # the ambulance URL to call at 0
+            </div>  # end timer side
+            <form method="POST" action="{{ url_for('resolve_episode', eid=episode.id) }}">  # feeling-better form
+              <button class="btn btn-green" type="submit">😌 Feeling better now</button>  # resolve button
+            </form>  # end form
+          </div>  # end countdown row
+          <div class="bar"><i id="bar"></i></div>  # progress bar fill
+          <p class="muted" style="margin-top:8px">If the remedy hasn't worked when the timer ends,  # safety note line 1
+             an ambulance will be called automatically. No random calls and no double dosage.</p>  # safety note line 2
+        </div>  # end countdown wrapper
+      {% elif episode.status == 'ambulance_dispatched' %}  # timer expired / ambulance called
+        <div class="alert">🚑 The remedy did not work within the reaction window —  # alert line 1
+            an ambulance has been dispatched automatically. Hold on.</div>  # alert line 2
+      {% elif episode.status == 'resolved' %}  # episode resolved
+        <p style="background:#f0fdf4;border:1px solid #bbf7d0;padding:10px 14px;border-radius:12px">  # green confirmation box
+          ✅ Resolved — glad you're feeling better.</p>  # resolved message
+      {% endif %}  # end remedy states
+
+      <div class="grid-2" style="margin-top:16px">  # two-button row
+        <form method="POST" action="{{ url_for('ambulance_episode', eid=episode.id) }}">  # emergency form
+          <button class="btn btn-danger btn-sm" style="width:100%" type="submit"  # emergency button
+                  onclick="return confirm('Call an ambulance immediately?')">🚨 EMERGENCY - call ambulance</button>  # with confirm popup
+        </form>  # end form
+        <form method="POST" action="{{ url_for('advance_timer', eid=episode.id) }}">  # dev timer button
+          <button class="btn btn-ghost btn-sm" style="width:100%" type="submit">Dev: test timer expiry</button>  # expiry test button
+        </form>  # end form
+      </div>  # end button row
+    </div>  # end remedy card
+  {% endif %}  # end remedy section
+
+  {% if episode.severity in ('high','critical') %}  # EMERGENCY button for serious cases
+    <div class="card">  # emergency card
+      <h2>🚨 Emergency</h2>  # card title
+      <form method="POST" action="{{ url_for('ambulance_episode', eid=episode.id) }}">  # ambulance form
+        <button class="btn btn-danger btn-sm" style="width:100%" type="submit"  # emergency button
+                onclick="return confirm('Call an ambulance immediately?')">🚨 EMERGENCY - call ambulance</button>  # with confirm popup
+      </form>  # end form
+    </div>  # end card
+  {% endif %}  # end emergency section
+
+  <div class="card">  # "what happened" timeline card
+    <h2>📋 What happened</h2>  # card title
+    <ul class="timeline">  # timeline list
+      {% for a in episode.actions %}  # loop over all recorded actions
+        <li><span class="t">{{ a.message }}</span><br><span class="d">{{ a.ts }}</span></li>  # action message + timestamp
+      {% endfor %}  # end loop
+    </ul>  # end list
+  </div>  # end card
+  <script>  # countdown JavaScript
+    (function(){  # immediately-invoked function
+      var el = document.getElementById('countdown');  # find the countdown element
+      if(!el) return;  # stop if not present
+      var deadline = parseFloat(el.getAttribute('data-deadline')) * 1000;  # read deadline (seconds -> ms)
+      var bar = document.getElementById('bar');  # find the progress bar
+      var total = Math.max(1, deadline - Date.now());  # total duration in ms
+      function tick(){  # one countdown tick
+        var rem = deadline - Date.now();  # remaining ms
+        if(rem <= 0){  # timer finished
+          el.textContent = '00:00';  # show 00:00
+          if(bar) bar.style.width = '0%';  # empty the bar
+          fetch(el.getAttribute('data-url'), {method:'POST', headers:{'Content-Type':'application/json'}})  # POST to ambulance endpoint
+            .then(function(){ location.reload(); });  # reload the page after dispatch
+          return;  # stop ticking
+        }  # end finished branch
+        var s = Math.floor(rem/1000);  # remaining seconds
+        var m = Math.floor(s/60); s = s % 60;  # split into minutes + seconds
+        el.textContent = (m<10?'0':'')+m+':'+(s<10?'0':'')+s;  # format as MM:SS
+        if(bar) bar.style.width = Math.max(0,(rem/total)*100) + '%';  # update bar width
+      }  # end tick
+      setInterval(tick, 1000);  # tick every second
+      tick();  # tick immediately
+    })();  # end IIFE
+  </script>  # end script
+
+{% elif page == 'history' %}  # HISTORY page
+  <div class="card">  # history header card
+    <h2>📚 Full history — {{ patient.name }}</h2>  # page title with patient name
+    <p class="muted">{{ patient.episodes|length }} problem(s) recorded.</p>  # count of problems
+  </div>  # end card
+  {% for ep in episodes %}  # loop over every episode (newest first)
+    <div class="card">  # one episode card
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">  # header row
+        <h2 style="margin:0;font-size:17px">  # episode heading
+          {{ ep.created_at }} ·  # when it happened
+          <span class="badge b-{{ ep.severity }}">{{ ep.severity|upper }}</span>  # severity badge
+          {% if ep.status == 'resolved' %}<span class="badge b-low">RESOLVED</span>{% endif %}  # resolved badge
+          {% if ep.status == 'ambulance_dispatched' %}<span class="badge b-critical">AMBULANCE</span>{% endif %}  # ambulance badge
+          {% if ep.insurance_status == 'applied' %}<span class="badge b-low">INSURED</span>{% endif %}  # insured badge
+        </h2>  # end heading
+        <a class="btn btn-ghost btn-sm" href="{{ url_for('episode_page', eid=ep.id) }}">View</a>  # open this episode
+      </div>  # end header row
+      <p class="muted">Symptoms: {{ ', '.join(ep.symptoms) }}</p>  # symptoms of the episode
+      {% if ep.remedy %}  # if a remedy was given
+        <p>💊 {{ ep.remedy.medicine }} · <span class="muted">{{ ep.remedy.dosage }}</span></p>  # medicine + dosage
+      {% endif %}  # end remedy line
+      <p class="muted">Estimated cost: ₹ {{ '%.2f'|format(ep.est_cost) }}</p>  # estimated cost
+      <ul class="timeline">  # actions timeline
+        {% for a in ep.actions %}  # loop over actions
+          <li><span class="t">{{ a.message }}</span><br><span class="d">{{ a.ts }}</span></li>  # action message + timestamp
+        {% endfor %}  # end loop
+      </ul>  # end list
+    </div>  # end episode card
+  {% else %}  # no episodes at all
+    <div class="card"><p class="muted">No problems recorded yet. <a href="{{ url_for('dashboard') }}">Start one →</a></p></div>  # empty-state message
+  {% endfor %}  # end loop
+{% endif %}  # end page switch
+
+</div>  # end container
+<div class="foot">Health 360 · single-file prototype · API ready for hospital / emergency-contact / ambulance integration</div>  # page footer
+</body>  # end body
+</html>  # end HTML
+"""  # end of the template string
+
+
+# ---------------------------------------------------------------------------
+# 8. ENTRY POINT
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Start the background sweeper, then the web server, and open the browser."""  # program entry point
+    print(f"[{APP_NAME}] starting on http://{HOST}:{PORT}")  # log the startup URL
+    print(f"[{APP_NAME}] Timer mode: {'fast (seconds, demo)' if TIMER_MODE == 'fast' else 'real (minutes, production)'}")  # log the timer mode
+
+    threading.Thread(target=background_sweeper, daemon=True, name="ambulance-sweeper").start()  # start the ambulance watchdog thread
+    threading.Timer(1.5, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()  # auto-open the browser after 1.5s
+    app.run(host=HOST, port=PORT, debug=False)  # start the Flask web server
+
+
+if __name__ == "__main__":  # only run when executed directly (not when imported)
+    main()  # call the main entry point
+```
+
+That's the full annotated file (and Flask 3.1.3 is installed and working). Run it with `python health360.py`.
