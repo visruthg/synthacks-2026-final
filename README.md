@@ -9,3 +9,4 @@ Health 360 is an AI-powered healthcare web app designed to make general health i
 ⚠️ Health 360 is not a doctor or diagnostic tool; its information is for general educational purposes and does not replace professional medical advice.
 🚀 Future versions could include health tracking, medication reminders, appointment assistance, multilingual support, and doctor/hospital discovery.
 💙 Our goal: Use AI and modern web technology to make understanding health information easier, smarter, and more accessible to everyone.
+Link-http://127.0.0.1:5000.
